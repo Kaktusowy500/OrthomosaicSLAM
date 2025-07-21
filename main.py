@@ -2,6 +2,12 @@ import cv2
 import numpy as np
 from imutils import paths
 import argparse
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 
 
 class Orthomosaic:
@@ -16,37 +22,86 @@ class Orthomosaic:
             "-i",
             "--images",
             type=str,
-            required=True,
             help="path to input directory of images to stitch",
         )
         self.ap.add_argument(
             "-o", "--output", type=str, required=True, help="path to the output image"
         )
+        self.ap.add_argument("-v", "--video", type=str, help="path to video input")
         self.ap.add_argument("--debug", action="store_true", help="enable debug mode")
         self.args = vars(self.ap.parse_args())
         self.debug = self.args.get("debug", False)
 
+    def run(self):
+        if self.args.get("images"):
+            self.load_dataset()
+            self.mixer()
+        elif self.args.get("video"):
+            self.from_video()
+        else:
+            logging.error("No input provided. Please specify images or video.")
+            return
+
+    def scale_image(self, image, scale):
+        width = int(image.shape[1] * scale)
+        height = int(image.shape[0] * scale)
+        dim = (width, height)
+        return cv2.resize(image, dim)
+
     def load_dataset(self):
         # grab the paths to the input images and initialize our images list
         if self.debug:
-            print("[INFO] Importing Images...")
+            logging.info("Importing Images...")
         self.imagePaths = sorted(list(paths.list_images(self.args["images"])))
         self.images = []
         for imagePath in self.imagePaths:
-            self.image_temp = cv2.imread(imagePath)
-            scale_percent = 50  # percent of original size
-            width = int(self.image_temp.shape[1] * scale_percent / 100)
-            height = int(self.image_temp.shape[0] * scale_percent / 100)
-            dim = (width, height)
-            self.image = cv2.resize(self.image_temp, dim)
-            self.images.append(self.image)
+            image = cv2.imread(imagePath)
+            processed_image = self.scale_image(image, 0.5)
+            self.images.append(processed_image)
         if self.debug:
-            print("[INFO] Importing Complete")
+            logging.info("Importing Complete")
+
+    def from_video(self):
+        if self.debug:
+            logging.info("Importing Video...")
+        self.cap = cv2.VideoCapture(self.args["video"])
+        self.nth_frame = 20
+        self.images = []
+        frame_count = 0
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                logging.warning(
+                    "Failed to read frame from video or end of video reached"
+                )
+                break
+            frame_count += 1
+            frame = self.scale_image(frame, 0.25)
+            cv2.imshow("Video Frame", frame)
+            if frame_count % self.nth_frame == 0:
+                self.images.append(frame)
+                if len(self.images) > 1:
+                    if len(self.images) == 2:
+                        self.temp_image = self.sticher(self.images[-2], self.images[-1])
+                    else:
+                        self.temp_image = self.sticher(self.temp_image, self.images[-1])
+                    cv2.imshow("output_temp", self.temp_image)
+                    cv2.waitKey(500)
+
+            if cv2.waitKey(25) & 0xFF == ord("q"):
+                break
+
+        self.final_image = self.temp_image
+        cv2.imshow("output", self.final_image)
+        cv2.imwrite(self.args["output"], self.final_image)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+        self.cap.release()
 
     def mixer(self):
         self.no_raw_images = len(self.images)
         if self.debug:
-            print(f"[INFO] {self.no_raw_images} Images have been loaded")
+            logging.info(f"{self.no_raw_images} Images have been loaded")
         for x in range(self.no_raw_images):
             if x == 0:
                 self.temp_image = self.sticher(self.images[x], self.images[x + 1])
@@ -54,22 +109,20 @@ class Orthomosaic:
                 self.temp_image = self.sticher(self.temp_image, self.images[x + 1])
             else:
                 self.final_image = self.temp_image
+            cv2.imshow("output_temp", self.temp_image)
+            cv2.waitKey(200)
 
         cv2.imshow("output", self.final_image)
         cv2.imwrite(self.args["output"], self.final_image)
         cv2.waitKey(0)
         cv2.destroyAllWindows()
-        pass
 
     def sticher(self, image1, image2):
-        self.image1 = image1
-        self.image2 = image2
         orb = cv2.ORB_create(nfeatures=1000)
-        print(self.image1.shape)
+        logging.info(f"Processing image with shape: {image1.shape}")
 
-        # Find the key points and descriptors with ORB
-        keypoints1, descriptors1 = orb.detectAndCompute(self.image1, None)
-        keypoints2, descriptors2 = orb.detectAndCompute(self.image2, None)
+        keypoints1, descriptors1 = orb.detectAndCompute(image1, None)
+        keypoints2, descriptors2 = orb.detectAndCompute(image2, None)
 
         bf = cv2.BFMatcher_create(cv2.NORM_HAMMING)
 
@@ -102,8 +155,7 @@ class Orthomosaic:
             result = self.wrap_images(image2, image1, M)
             return result
         else:
-            print("Error")
-            pass
+            logging.error("Not enough matches found")
 
     def wrap_images(self, image1, image2, H):
         rows1, cols1 = image1.shape[:2]
@@ -114,8 +166,6 @@ class Orthomosaic:
         temp_points = np.float32(
             [[0, 0], [0, rows2], [cols2, rows2], [cols2, 0]]
         ).reshape(-1, 1, 2)
-        # When we have established a homography we need to warp perspective
-        # Change field of view
         list_of_points_2 = cv2.perspectiveTransform(temp_points, H)
         list_of_points = np.concatenate((list_of_points_1, list_of_points_2), axis=0)
         [x_min, y_min] = np.int32(list_of_points.min(axis=0).ravel() - 0.5)
@@ -138,5 +188,4 @@ class Orthomosaic:
 
 if __name__ == "__main__":
     tester = Orthomosaic()
-    tester.load_dataset()
-    tester.mixer()
+    tester.run()
